@@ -348,3 +348,66 @@ once for the same name during planning (observed in some join patterns),
 any side effects in the resolver (cache refresh, logging, etc.) should be
 idempotent. "Ensure the local table reflects the remote state" is safe.
 "Append the latest delta" is not.
+
+## Same-connection re-entrancy: a known deadlock
+
+The replacement scan callback fires during the binder phase while DuckDB
+holds the connection lock. If the callback attempts to execute a query on
+the **same** connection — even a materializing call like `fetchdf()` —
+it will deadlock waiting for the lock it already holds.
+
+This was confirmed via stress testing: both `con.sql(...).fetchdf()` and
+`con.sql(...)` (returning a lazy `DuckDBPyRelation`) inside the callback
+deadlock when called on the same connection. This is not a bug in our
+patch — it is an inherent constraint of DuckDB's replacement scan
+architecture. The built-in frame-inspection scan has the same limitation
+(it only reads Python variables, never executes queries).
+
+**Safe patterns for resolver callbacks:**
+
+1. Return pre-materialized data (DataFrame, Arrow Table) that was
+   prepared *before* the query, e.g., from a cache.
+2. Query a **different** `duckdb.connect()` connection in the callback
+   (different connections have independent locks).
+3. Do cache-refresh work using a separate connection, then return the
+   cached data.
+
+**Unsafe (deadlock):**
+
+```python
+# DO NOT do this — deadlocks
+def resolver(table_name, **kwargs):
+    return con.sql("SELECT * FROM some_table").fetchdf()  # same con!
+```
+
+**Safe equivalent:**
+
+```python
+cache_con = duckdb.connect("cache.db")  # separate connection
+
+def resolver(table_name, **kwargs):
+    return cache_con.sql(f'SELECT * FROM "{table_name}"').fetchdf()
+```
+
+For the DuckLake caching pattern described above, the refresh and read
+operations should use a dedicated cache connection, not the connection
+that is executing the user's query.
+
+## Stress test results
+
+27 tests covering the replacement scan callback mechanism (run against
+the patched duckdb-python v1.5.1):
+
+| Category | Tests | Result |
+|---|---|---|
+| Basic resolution (DataFrame, Arrow, RecordBatchReader) | 3 | PASS |
+| Cross-connection resolver | 1 | PASS |
+| Return type edge cases (empty, bad type, cross-con relation) | 3 | PASS |
+| Multiple registered scans (priority, fallthrough, 100 scans) | 3 | PASS |
+| SQL patterns (CTE, VIEW, prepared, self-join, subquery, UNION, GROUP BY, window) | 8 | PASS |
+| Exception handling | 1 | PASS |
+| Schema-qualified names (real schema, fake schema, three-part) | 3 | PASS |
+| Concurrency (8 threads) | 1 | PASS |
+| Scale (1M rows) | 1 | PASS |
+| Lifecycle (GC closure, close) | 2 | PASS |
+| Same-connection re-entrancy | 2 | SKIP (known deadlock) |
