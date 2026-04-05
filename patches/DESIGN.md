@@ -239,3 +239,112 @@ Experimental findings on how DuckDB handles various forms:
 Note: `FROM [products]` is a syntax error — square brackets are not valid
 SQL quoting in DuckDB. They only survive as literal characters inside
 double quotes (e.g., `"[Book1.xlsx]Sheet1!A1"`).
+
+## Schema-qualified names
+
+With the named-kwargs callback signature `(table_name, schema_name,
+catalog_name)`, DuckDB's dot-separated qualified names map naturally:
+
+| SQL | `table_name` | `schema_name` | `catalog_name` |
+|---|---|---|---|
+| `FROM products` | `products` | `""` | `""` |
+| `FROM Sheet1.products` | `products` | `Sheet1` | `""` |
+| `FROM "Sheet1"."products"` | `products` | `Sheet1` | `""` |
+| `FROM "WB"."Sheet1"."products"` | `products` | `Sheet1` | `WB` |
+
+This means `schema.table` syntax can represent `worksheet.object` and
+three-part syntax can represent `workbook.worksheet.object` — matching
+Excel's own hierarchy without any custom parsing.
+
+## Return types and optimizer pushdown
+
+The replacement scan callback can return any Python object that DuckDB's
+existing `TryReplacementObject` knows how to scan. The choice of return
+type has significant performance implications because it determines how
+much of the outer query's predicates and projections can be pushed down
+into the scan.
+
+### What each return type does
+
+| Return type | Internal mechanism | Pushdown |
+|---|---|---|
+| **`DuckDBPyRelation`** | Query plan spliced as `SubqueryRef` — no data copied | Full: predicates, projections, joins all optimized through the subquery boundary. Pushdown reaches whatever the underlying relation's scan supports. |
+| **pandas DataFrame** | `pandas_scan` table function | Full DuckDB-side pushdown (data is in memory, DuckDB reads only needed columns/rows) |
+| **Arrow Table / Dataset** | `arrow_scan` with PyArrow compute | Projection + filter pushdown via PyArrow expressions |
+| **Arrow RecordBatchReader** | `arrow_scan` | Projection pushdown; filter pushdown if PyArrow dataset is available |
+| **Polars DataFrame** | `.to_arrow()` then `arrow_scan` | Same as Arrow Table |
+| **Polars LazyFrame** | Filter expressions translated into Polars plan | Polars-native pushdown before materialization |
+| **bare `__arrow_c_stream__`** | `arrow_scan_dumb` | No pushdown (single-use stream) |
+
+### DuckDBPyRelation: the zero-copy path
+
+A `DuckDBPyRelation` is a lazy query plan — a wrapper around DuckDB's
+internal `Relation` object. When the replacement scan encounters one, it
+does not materialize any data. It extracts the relation's query node and
+splices it directly into the outer query as a subquery:
+
+```cpp
+auto select = make_uniq<SelectStatement>();
+select->node = pyrel->GetRel().GetQueryNode();
+auto subquery = make_uniq<SubqueryRef>(std::move(select));
+```
+
+The DuckDB optimizer then sees through the subquery boundary and applies
+predicate pushdown, projection pushdown, and join reordering across the
+whole plan. If the underlying relation is backed by Parquet (via DuckLake,
+for example), this means partition pruning, min/max statistics, and zone
+maps all apply — even though the user's query refers to a name that was
+resolved dynamically by the replacement scan callback.
+
+**Constraint:** the `DuckDBPyRelation` must have been created by the same
+`DuckDBPyConnection` that is executing the query. DuckDB checks this and
+rejects cross-connection relations.
+
+### Design implication: the resolver as a policy layer
+
+Because the resolver can return a `DuckDBPyRelation`, it can act as a
+**transparent caching and routing layer** rather than a data materializer.
+The resolver decides *where* to read from; DuckDB's optimizer decides
+*how* to read efficiently.
+
+Example: a Socrata open data resolver backed by DuckLake for local caching:
+
+```python
+def resolver(table_name, schema_name="", catalog_name=""):
+    if schema_name != "Socrata":
+        return None
+
+    # Check local DuckLake cache
+    if is_cached(table_name) and not is_stale(table_name):
+        return con.sql(f'SELECT * FROM ducklake."{table_name}"')
+
+    # Refresh cache from remote, then return local relation
+    refresh_from_socrata(table_name)  # idempotent
+    return con.sql(f'SELECT * FROM ducklake."{table_name}"')
+```
+
+The user writes:
+
+```sql
+SELECT *
+FROM Socrata."nyc.data.gov.Parking Tickets"
+WHERE zipcode = '11231'
+```
+
+DuckDB resolves the name, gets back a relation against DuckLake-managed
+Parquet, and pushes `WHERE zipcode = '11231'` all the way down to the
+storage layer — partition pruning, predicate pushdown, the full optimizer
+stack. The user never knows whether the data came from the network or a
+local cache.
+
+The resolver runs during query planning (the binder phase). DuckDB caches
+the replacement scan result as a CTE internally, so even if the same name
+appears multiple times in a query (e.g., self-join), the resolver is called
+once and the result is reused. This means any refresh/cache operations in
+the resolver execute once per query, not once per reference.
+
+**Idempotency matters:** because the replacement scan can fire more than
+once for the same name during planning (observed in some join patterns),
+any side effects in the resolver (cache refresh, logging, etc.) should be
+idempotent. "Ensure the local table reflects the remote state" is safe.
+"Append the latest delta" is not.
