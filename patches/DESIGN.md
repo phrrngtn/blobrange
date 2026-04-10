@@ -4,20 +4,34 @@
 
 Adds `con.add_replacement_scan(callback)` to the DuckDB Python API, allowing
 Python code to register a callable that DuckDB invokes when it encounters an
-unresolved table name during query planning. The callback returns a scannable
-Python object (pandas DataFrame, PyArrow Table, etc.) or `None` to decline.
+unresolved table name during query planning.
+
+The callback receives keyword arguments `(table_name, schema_name,
+catalog_name)` and can return:
+
+- `None` — decline (DuckDB tries the next replacement scan)
+- A dict `{"type": "table", ...}` — name redirect to another catalog entry
+  (full optimizer pushdown, zero data copying)
+- A dict `{"type": "query", "sql": "..."}` — SQL rewrite as a subquery
+  (parsed lock-free, full pushdown)
+- A scannable Python object (DataFrame, Arrow Table, etc.) — scanned
+  directly via the existing `TryReplacementObject` machinery
 
 ```python
-import duckdb, pandas as pd
-
-def my_resolver(table_name: str):
-    if table_name == "products":
-        return pd.DataFrame({"id": [1, 2], "name": ["Widget", "Gadget"]})
-    return None
+import duckdb
 
 con = duckdb.connect()
-con.add_replacement_scan(my_resolver)
-con.sql("SELECT * FROM products").show()
+con.execute("ATTACH 'cache.duckdb' AS cache")
+
+def resolver(table_name, schema_name="", catalog_name=""):
+    if schema_name == "socrata":
+        ensure_cached(table_name)  # refresh via separate connection
+        return {"type": "table", "catalog": "cache", "schema": "main", "table": table_name}
+    return None
+
+con.add_replacement_scan(resolver)
+con.sql("SELECT * FROM socrata.parking_tickets WHERE zipcode = '11231'")
+# Predicate pushes all the way to the Parquet cache
 ```
 
 ## Why this patch exists
@@ -43,6 +57,10 @@ cannot work with frame inspection because the Excel objects are not Python
 variables — they live in the Excel process and must be fetched through COM
 calls.
 
+A broader use case is external catalog integration (Socrata, Rule4) where
+hundreds of thousands of datasets should be addressable by name with
+transparent local caching and full predicate pushdown.
+
 ## How the patch was conceived
 
 ### The problem space
@@ -64,7 +82,8 @@ Excel objects as tables? Several approaches were considered and rejected:
    `__arrow_c_stream__` for every known Excel name and inject them into the
    caller's namespace. The existing frame-inspection replacement scan would
    find them. This works (verified experimentally) but requires
-   pre-enumerating all Excel objects and polluting the namespace.
+   pre-enumerating all Excel objects and polluting the namespace. Does not
+   scale to catalogs with hundreds of thousands of entries.
 
 4. **Callback-based replacement scan** — Register a Python callable that
    DuckDB calls when it needs to resolve a name. DuckDB does all the
@@ -90,21 +109,86 @@ the internal architecture:
   DuckDBPyRelation) to a DuckDB `TableRef`. This is the heavy lifting —
   and it's reusable.
 
-The patch therefore:
+### The deadlock problem and the dict-dispatch solution
 
-1. Subclasses `ReplacementScanData` to hold a `py::function`.
-2. Implements a new replacement scan function that acquires the GIL, calls
-   the Python callback, and feeds the result through `TryReplacementObject`.
-3. Exposes `add_replacement_scan(callback)` on `DuckDBPyConnection` via
-   pybind11, which emplaces the new scan into `config.replacement_scans`.
+The initial prototype simply called `TryReplacementObject` on whatever the
+Python callback returned. This works for DataFrames and Arrow Tables, but
+the real value of the replacement scan is the ability to redirect names
+to other catalog entries with full optimizer pushdown — and that requires
+returning a `DuckDBPyRelation` or constructing a `TableRef` AST node.
+
+The problem: creating a `DuckDBPyRelation` requires calling `con.sql()`
+or `con.table()`, which acquires the `ClientContext` lock. But the binder
+already holds that lock when the replacement scan fires. Result: deadlock.
+
+This was traced through the duckdb-python and DuckDB core source:
+
+```
+con.sql("SELECT * FROM ...")
+  → RunQuery
+    → GetStatements
+      → connection.ExtractStatements
+        → context->ParseStatements
+          → LockContext()    ← DEADLOCK: binder already holds this lock
+```
+
+Even `con.table("name")` deadlocks because it calls `TableInfo()` which
+runs inside `RunFunctionInTransaction`, which also acquires the lock.
+
+The solution: **bypass the connection entirely and construct AST nodes
+directly in C++**. The Python callback returns a dict describing what it
+wants, and the C++ code builds the corresponding `TableRef` without
+touching any connection locks:
+
+- `{"type": "table", ...}` → constructs a `BaseTableRef` (pure data:
+  three strings) wrapped in a `SubqueryRef`
+- `{"type": "query", "sql": "..."}` → parses the SQL using `Parser`
+  directly (stateless, no lock) and wraps the result in a `SubqueryRef`
+
+Both paths produce unbound AST nodes that the binder on the active
+connection resolves against its own catalog. The optimizer sees through
+the `SubqueryRef` boundary, enabling full predicate pushdown, projection
+pushdown, partition pruning, and join reordering.
+
+The `SubqueryRef` wrapping for the `"table"` path is necessary because
+the binder's replacement scan code wraps non-`SubqueryRef`/non-
+`TableFunctionRef` results in a `SELECT * FROM ...` subquery and drops
+the user's alias in the process. By returning a `SubqueryRef` with the
+alias pre-set, we avoid this.
+
+### Lock-free SQL parsing
+
+The `"query"` path uses DuckDB's `Parser` class directly:
+
+```cpp
+ParserOptions options;
+options.preserve_identifier_case = true;
+Parser parser(options);
+parser.ParseQuery(sql);
+```
+
+`Parser` is stateless — it needs only `ParserOptions`, which are simple
+config flags. The normal path (`ClientContext::ParseStatements`) wraps this
+in a `LockContext()` call, but the lock is for protecting `ClientContext`
+state during parsing (pragma handling, error processing), not for the
+parser itself. By constructing a `Parser` directly, we avoid the lock.
+
+**Known limitation:** the `ParserOptions` are not read from the active
+session's settings (e.g., `preserve_identifier_case`). We hardcode sensible
+defaults. This could cause subtle differences in how names are handled if
+the session has non-default parser settings.
 
 ### GIL safety
 
 The `py::function` stored in `PythonCallbackReplacementScanData` is a
-Python object that must be destroyed while holding the GIL. The destructor
-runs when `config.replacement_scans` is cleared during database shutdown,
-which happens outside any Python context. The destructor therefore acquires
-the GIL before releasing the `py::function`:
+Python object that must be destroyed while holding the GIL. pybind11's
+`py::object` types are RAII wrappers around `PyObject*` — their
+destructors call `Py_DECREF`, which is a Python C API call that requires
+the GIL.
+
+The destructor runs when `config.replacement_scans` is cleared during
+database shutdown, which happens on a C++ thread without the GIL. The
+destructor therefore acquires the GIL before releasing the `py::function`:
 
 ```cpp
 ~PythonCallbackReplacementScanData() override {
@@ -115,78 +199,47 @@ the GIL before releasing the `py::function`:
 
 This was discovered via a crash (SIGABRT) during the initial test run —
 pytest's process exit triggered database cleanup, which destroyed the
-callback without the GIL held.
+callback without the GIL held. The `Py_DECREF` corrupted the interpreter
+state.
 
 ### The callback itself acquires the GIL
 
 The replacement scan callback is invoked from the DuckDB binder, which runs
-on DuckDB's internal threads without the GIL. The callback function uses
-`py::gil_scoped_acquire` before calling into Python:
+without the GIL. The callback function uses `py::gil_scoped_acquire` before
+calling into Python:
 
 ```cpp
 py::gil_scoped_acquire acquire;
-result = scan_data.callback(py::str(input.table_name));
+result = scan_data.callback("table_name"_a = py::str(input.table_name),
+                            "schema_name"_a = py::str(input.schema_name),
+                            "catalog_name"_a = py::str(input.catalog_name));
 ```
 
 Exceptions from the Python callback are caught and result in the scan
 returning `nullptr` (decline), allowing the next scan in the chain to try.
+This means there is no way for the callback to surface a meaningful error
+message to the user — the query will fail with a generic "table not found"
+error.
 
-## Patch details
+## Callback dispatch logic
 
-**Base version:** duckdb-python v1.5.1 (tag `v1.5.1`, commit `1fc6421`)
+The C++ callback (`PythonCallbackReplacementScan`) dispatches on the return
+type from the Python callable:
 
-**Files modified:**
+1. **`None`** → return `nullptr` (decline)
+2. **`dict`** → dispatch to `HandleDictDirective`:
+   - `{"type": "table", "catalog": ..., "schema": ..., "table": ...}` →
+     construct `BaseTableRef` wrapped in `SubqueryRef` (name redirect)
+   - `{"type": "query", "sql": "SELECT ..."}` → parse SQL lock-free,
+     wrap in `SubqueryRef` (SQL rewrite)
+   - Any other `"type"` → raise `InvalidInputException`
+   - Missing `"type"` key → raise `InvalidInputException`
+3. **Anything else** → pass to `TryReplacementObject` (DataFrame, Arrow
+   Table, etc.)
 
-| File | Change |
-|---|---|
-| `src/duckdb_py/include/duckdb_python/python_replacement_scan.hpp` | Add `PythonCallbackReplacementScanData` struct and `PythonCallbackReplacementScan` function declaration |
-| `src/duckdb_py/python_replacement_scan.cpp` | Implement `PythonCallbackReplacementScan` (~25 lines) |
-| `src/duckdb_py/pyconnection.cpp` | Add `AddReplacementScanMethod`, forward declaration, and pybind11 binding (~20 lines) |
-
-**Total: ~65 lines of C++ across 3 files.**
-
-## Applying the patch
-
-```bash
-cd /path/to/duckdb-python   # checked out at v1.5.1
-git apply /path/to/blobrange/patches/duckdb-python-add-replacement-scan.patch
-```
-
-## Building
-
-```bash
-# Install build dependencies
-pip install "scikit-build-core>=0.11.4" "pybind11[global]>=2.6.0" "setuptools_scm>=8.0"
-
-# Build (editable install)
-OVERRIDE_GIT_DESCRIBE=v1.5.1 pip install --no-build-isolation -e .
-```
-
-## Testing
-
-The blobrange repo includes end-to-end tests in
-`tests/test_replacement_scan_e2e.py` that exercise:
-
-- Simple SELECT through a replacement scan callback
-- JOINs between two replacement-scanned tables
-- JOINs between replacement-scanned and native DuckDB tables
-- Callback returning None (falls through to error)
-- Catalog tables taking priority over the callback
-- Callback invoked per query (no stale caching by DuckDB)
-
-## Upstream consideration
-
-This patch is minimal and self-contained. It does not modify the existing
-`PythonReplacementScan::Replace` behavior (frame inspection continues to
-work as before). The new scan is appended to the replacement scan vector
-after the existing one, so user-registered callbacks are tried after the
-built-in frame inspection.
-
-A reasonable upstream API might differ in naming or placement (e.g.,
-`register_replacement_scan`, or a parameter on `duckdb.connect()`), but the
-underlying mechanism — subclassing `ReplacementScanData` to hold a
-`py::function` and emplacing into `config.replacement_scans` — is the
-natural fit given the existing architecture.
+Each path is an affirmative decision by the resolver. There is no
+fallthrough or default behavior — the resolver either declines (`None`),
+redirects (dict), or provides data (object).
 
 ## SQL quoting and Excel range addresses
 
@@ -217,10 +270,6 @@ SELECT p.name, o.qty
 FROM products AS p
 JOIN "Orders!$A$1:$C$500" AS o ON p.id = o.product_id
 ```
-
-The callback receives the literal string (`Sheet1!$A$1:$D$100`,
-`[Pricing.xlsx]Sheet1!prices`, etc.) and can parse the Excel address
-components as needed.
 
 Experimental findings on how DuckDB handles various forms:
 
@@ -258,156 +307,176 @@ Excel's own hierarchy without any custom parsing.
 
 ## Return types and optimizer pushdown
 
-The replacement scan callback can return any Python object that DuckDB's
-existing `TryReplacementObject` knows how to scan. The choice of return
-type has significant performance implications because it determines how
-much of the outer query's predicates and projections can be pushed down
-into the scan.
+The choice of return type determines how much of the outer query's
+predicates and projections can be pushed down into the scan.
 
-### What each return type does
+### Dict-based returns (zero-copy, full pushdown)
+
+| Dict type | Internal mechanism | Pushdown |
+|---|---|---|
+| `{"type": "table", ...}` | `BaseTableRef` in `SubqueryRef` — pure AST, no data | Full: optimizer resolves the redirected name against the catalog and applies all optimizations (predicate pushdown, projection, partition pruning, zone maps) |
+| `{"type": "query", "sql": ...}` | Parsed `SelectStatement` in `SubqueryRef` — pure AST | Full: optimizer sees through the subquery boundary |
+
+These paths construct unbound AST nodes without acquiring any locks or
+copying any data. The binder on the active connection resolves all table
+references in the AST against its own catalog.
+
+### Object returns (data materialized in Python)
 
 | Return type | Internal mechanism | Pushdown |
 |---|---|---|
-| **`DuckDBPyRelation`** | Query plan spliced as `SubqueryRef` — no data copied | Full: predicates, projections, joins all optimized through the subquery boundary. Pushdown reaches whatever the underlying relation's scan supports. |
 | **pandas DataFrame** | `pandas_scan` table function | Full DuckDB-side pushdown (data is in memory, DuckDB reads only needed columns/rows) |
 | **Arrow Table / Dataset** | `arrow_scan` with PyArrow compute | Projection + filter pushdown via PyArrow expressions |
 | **Arrow RecordBatchReader** | `arrow_scan` | Projection pushdown; filter pushdown if PyArrow dataset is available |
 | **Polars DataFrame** | `.to_arrow()` then `arrow_scan` | Same as Arrow Table |
 | **Polars LazyFrame** | Filter expressions translated into Polars plan | Polars-native pushdown before materialization |
 | **bare `__arrow_c_stream__`** | `arrow_scan_dumb` | No pushdown (single-use stream) |
+| **`DuckDBPyRelation`** | Query plan spliced as `SubqueryRef` | Full pushdown, but requires same connection and cannot be created inside the callback (deadlock) |
 
-### DuckDBPyRelation: the zero-copy path
+### The ATTACH + redirect pattern
 
-A `DuckDBPyRelation` is a lazy query plan — a wrapper around DuckDB's
-internal `Relation` object. When the replacement scan encounters one, it
-does not materialize any data. It extracts the relation's query node and
-splices it directly into the outer query as a subquery:
-
-```cpp
-auto select = make_uniq<SelectStatement>();
-select->node = pyrel->GetRel().GetQueryNode();
-auto subquery = make_uniq<SubqueryRef>(std::move(select));
-```
-
-The DuckDB optimizer then sees through the subquery boundary and applies
-predicate pushdown, projection pushdown, and join reordering across the
-whole plan. If the underlying relation is backed by Parquet (via DuckLake,
-for example), this means partition pruning, min/max statistics, and zone
-maps all apply — even though the user's query refers to a name that was
-resolved dynamically by the replacement scan callback.
-
-**Constraint:** the `DuckDBPyRelation` must have been created by the same
-`DuckDBPyConnection` that is executing the query. DuckDB checks this and
-rejects cross-connection relations.
-
-### Design implication: the resolver as a policy layer
-
-Because the resolver can return a `DuckDBPyRelation`, it can act as a
-**transparent caching and routing layer** rather than a data materializer.
-The resolver decides *where* to read from; DuckDB's optimizer decides
-*how* to read efficiently.
-
-Example: a Socrata open data resolver backed by DuckLake for local caching:
+The most powerful pattern for external catalogs: attach a cache database
+and use the `"table"` redirect to point at cached tables. The optimizer
+pushes predicates all the way to the storage layer.
 
 ```python
-def resolver(table_name, schema_name="", catalog_name=""):
-    if schema_name != "Socrata":
-        return None
+con = duckdb.connect()
+con.execute("ATTACH 'cache.duckdb' AS cache (READ_ONLY)")
 
-    # Check local DuckLake cache
-    if is_cached(table_name) and not is_stale(table_name):
-        return con.sql(f'SELECT * FROM ducklake."{table_name}"')
+def resolver(table_name, schema_name="", **kw):
+    if schema_name == "store":
+        return {"type": "table", "catalog": "cache", "schema": "main", "table": table_name}
+    return None
 
-    # Refresh cache from remote, then return local relation
-    refresh_from_socrata(table_name)  # idempotent
-    return con.sql(f'SELECT * FROM ducklake."{table_name}"')
+con.add_replacement_scan(resolver)
+con.sql("SELECT name FROM store.products WHERE price < 15")
+# EXPLAIN shows: SEQ_SCAN on cache.main.products with Filters: price<15
 ```
 
-The user writes:
-
-```sql
-SELECT *
-FROM Socrata."nyc.data.gov.Parking Tickets"
-WHERE zipcode = '11231'
-```
-
-DuckDB resolves the name, gets back a relation against DuckLake-managed
-Parquet, and pushes `WHERE zipcode = '11231'` all the way down to the
-storage layer — partition pruning, predicate pushdown, the full optimizer
-stack. The user never knows whether the data came from the network or a
-local cache.
-
-The resolver runs during query planning (the binder phase). DuckDB caches
-the replacement scan result as a CTE internally, so even if the same name
-appears multiple times in a query (e.g., self-join), the resolver is called
-once and the result is reused. This means any refresh/cache operations in
-the resolver execute once per query, not once per reference.
-
-**Idempotency matters:** because the replacement scan can fire more than
-once for the same name during planning (observed in some join patterns),
-any side effects in the resolver (cache refresh, logging, etc.) should be
-idempotent. "Ensure the local table reflects the remote state" is safe.
-"Append the latest delta" is not.
+This was verified via EXPLAIN output — the predicate appears on the scan
+node, confirming pushdown through the replacement scan boundary.
 
 ## Same-connection re-entrancy: a known deadlock
 
 The replacement scan callback fires during the binder phase while DuckDB
-holds the connection lock. If the callback attempts to execute a query on
-the **same** connection — even a materializing call like `fetchdf()` —
-it will deadlock waiting for the lock it already holds.
+holds the `ClientContext` lock. If the callback attempts any operation on
+the **same** connection — even a read-only one — it will deadlock.
 
-This was confirmed via stress testing: both `con.sql(...).fetchdf()` and
-`con.sql(...)` (returning a lazy `DuckDBPyRelation`) inside the callback
-deadlock when called on the same connection. This is not a bug in our
-patch — it is an inherent constraint of DuckDB's replacement scan
-architecture. The built-in frame-inspection scan has the same limitation
-(it only reads Python variables, never executes queries).
+This was confirmed via stress testing. Every operation on the same
+connection deadlocks inside the callback:
 
-**Safe patterns for resolver callbacks:**
+| Operation | Result |
+|---|---|
+| `con.sql("...")` (lazy relation) | DEADLOCK |
+| `con.table("...")` | DEADLOCK |
+| `con.sql("...").fetchdf()` | DEADLOCK |
+| `con.execute("...")` | DEADLOCK |
+| `con.cursor().sql("...")` | DEADLOCK |
 
-1. Return pre-materialized data (DataFrame, Arrow Table) that was
-   prepared *before* the query, e.g., from a cache.
-2. Query a **different** `duckdb.connect()` connection in the callback
-   (different connections have independent locks).
-3. Do cache-refresh work using a separate connection, then return the
-   cached data.
+The lock is the `ClientContext` lock, acquired by `ParseStatements` (for
+`sql`/`execute`) and `TableInfo` (for `table`). Even creating a cursor
+doesn't help — cursors share the same `ClientContext`.
 
-**Unsafe (deadlock):**
+**Safe patterns:**
 
-```python
-# DO NOT do this — deadlocks
-def resolver(table_name, **kwargs):
-    return con.sql("SELECT * FROM some_table").fetchdf()  # same con!
+1. Return a dict (`"table"` or `"query"`) — no connection interaction.
+2. Return pre-materialized data (DataFrame, Arrow Table).
+3. Query a **different** connection for cache refresh or data retrieval.
+4. Return a `DuckDBPyRelation` created *before* the query (outside the
+   callback). Relations are lazy plans, not snapshots — they see current
+   data when executed.
+
+**The dict-dispatch paths were designed specifically to avoid this
+deadlock.** They construct AST nodes in C++ without touching the
+connection, which is why `"table"` redirects and `"query"` rewrites are
+the preferred return types for production use.
+
+## Recursive resolution
+
+If the callback returns a dict that references a name the callback itself
+handles, the replacement scan fires again for that name. This is by design
+— DuckDB's binder resolves all names in the returned AST, and unresolved
+ones trigger replacement scans as usual.
+
+This enables chained resolution (A → B → C) but also creates a footgun:
+a resolver that redirects A → B → A will loop until DuckDB hits an
+internal limit. There is no depth guard in the replacement scan protocol.
+
+**Recommendation:** resolvers should not emit ASTs that reference names
+the resolver itself handles. If the resolver manages a namespace (e.g.,
+`schema_name == "socrata"`), the redirected targets should always be in
+a different namespace (e.g., `catalog: "cache"`) that resolves through
+normal catalog lookup without triggering the replacement scan again.
+
+## Patch details
+
+**Base version:** duckdb-python v1.5.1 (tag `v1.5.1`)
+
+**Files modified:**
+
+| File | Change |
+|---|---|
+| `python_replacement_scan.hpp` | `PythonCallbackReplacementScanData` struct (GIL-safe destructor), `PythonCallbackReplacementScan` declaration, callback protocol documentation |
+| `python_replacement_scan.cpp` | `HandleDictDirective` (table redirect + SQL rewrite), `PythonCallbackReplacementScan` (GIL acquire, callback dispatch), lock-free `Parser` usage |
+| `pyconnection.cpp` | `AddReplacementScanMethod`, forward declaration, pybind11 binding |
+| `test_add_replacement_scan.py` | 41 tests across 5 test classes |
+
+**Total: ~150 lines of C++, ~500 lines of tests.**
+
+## Applying the patch
+
+```bash
+cd /path/to/duckdb-python   # checked out at v1.5.1
+git apply /path/to/blobrange/patches/duckdb-python-add-replacement-scan.patch
 ```
 
-**Safe equivalent:**
+## Building
 
-```python
-cache_con = duckdb.connect("cache.db")  # separate connection
+```bash
+# Install build dependencies
+pip install "scikit-build-core>=0.11.4" "pybind11[global]>=2.6.0" "setuptools_scm>=8.0"
 
-def resolver(table_name, **kwargs):
-    return cache_con.sql(f'SELECT * FROM "{table_name}"').fetchdf()
+# Build (editable install)
+OVERRIDE_GIT_DESCRIBE=v1.5.1 pip install --no-build-isolation -e .
 ```
 
-For the DuckLake caching pattern described above, the refresh and read
-operations should use a dedicated cache connection, not the connection
-that is executing the user's query.
+## Test results
 
-## Stress test results
+41 tests across 5 classes, all passing:
 
-27 tests covering the replacement scan callback mechanism (run against
-the patched duckdb-python v1.5.1):
-
-| Category | Tests | Result |
+| Test class | Tests | Coverage |
 |---|---|---|
-| Basic resolution (DataFrame, Arrow, RecordBatchReader) | 3 | PASS |
-| Cross-connection resolver | 1 | PASS |
-| Return type edge cases (empty, bad type, cross-con relation) | 3 | PASS |
-| Multiple registered scans (priority, fallthrough, 100 scans) | 3 | PASS |
-| SQL patterns (CTE, VIEW, prepared, self-join, subquery, UNION, GROUP BY, window) | 8 | PASS |
-| Exception handling | 1 | PASS |
-| Schema-qualified names (real schema, fake schema, three-part) | 3 | PASS |
-| Concurrency (8 threads) | 1 | PASS |
-| Scale (1M rows) | 1 | PASS |
-| Lifecycle (GC closure, close) | 2 | PASS |
-| Same-connection re-entrancy | 2 | SKIP (known deadlock) |
+| `TestAddReplacementScanDataFrame` | 13 | DataFrame/Arrow returns, None, catalog priority, schema-qualified, exceptions, chaining |
+| `TestAddReplacementScanTableRedirect` | 10 | Name redirects with aliases, joins, self-joins, schema, views, CTAS, error on nonexistent |
+| `TestAddReplacementScanQueryRewrite` | 15 | SQL rewrites with aliases, filter composition, aggregation, table functions, joins, CTEs, subqueries, windows, prepared stmts, views, error cases |
+| `TestAddReplacementScanDictErrors` | 2 | Missing type key, unknown type |
+| `TestAddReplacementScanMixed` | 1 | All four return types in one resolver |
+
+Additional stress testing (50 tests, separate suite) covered threading
+(12 concurrent threads), scale (1M rows), recursive CTEs, LATERAL joins,
+DESCRIBE, EXPLAIN pushdown verification, and the ATTACH + redirect pattern.
+
+## Open design questions
+
+1. **The dict return is stringly-typed.** `{"type": "table"}` and
+   `{"type": "query"}` are runtime dispatch on magic strings. Typed Python
+   objects (e.g., `duckdb.ReplacementTableRef(catalog, schema, table)`) would
+   be more principled.
+
+2. **Polymorphic return.** The callback can return `None`, a dict, or a
+   scannable object — three different protocols. Separate registration
+   methods or a single wrapper type might be cleaner.
+
+3. **The SQL rewrite path uses default `ParserOptions`** rather than reading
+   from the active session's settings. This avoids touching the locked
+   `ClientContext` but could cause inconsistencies with non-default parser
+   configurations.
+
+4. **No way to signal errors from the callback** other than raising an
+   exception, which is silently treated as a decline. The query fails with
+   a generic "table not found" error regardless of what went wrong in the
+   callback.
+
+5. **No depth guard for recursive resolution.** A resolver that redirects
+   A → B → A will loop. This is a footgun that should at minimum be
+   documented, and ideally guarded against.
